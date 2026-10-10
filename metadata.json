@@ -1,0 +1,6 @@
+{
+  "name": "Blood Buddy - Health & Vitals Companion",
+  "description": "A clinical-grade cardiovascular telemetry companion for tracking blood pressure, scheduling doctor appointments, AI-powered OCR readings, and secure PDF/link reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
