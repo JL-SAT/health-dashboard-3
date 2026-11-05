@@ -2,7 +2,6 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabaseClient';
-import { GoogleGenAI, Type } from '@google/genai';
 import DashboardButton from './components/DashboardButton';
 import BloodPressureIcon from './components/icons/BloodPressureIcon';
 import AppointmentsIcon from './components/icons/AppointmentsIcon';
@@ -26,8 +25,52 @@ import HeartbeatIcon from './components/icons/HeartbeatIcon';
 import { useI18n } from './i18n/index';
 import LanguageSwitcher from './components/LanguageSwitcher';
 
-// Initialize the Gemini AI client. Assumes API_KEY is set in the environment.
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Photo scanning runs on the server (api/scan.ts) so the Gemini API key is never
+// shipped to the browser. Before uploading, photos are shrunk so they stay well
+// under Vercel's request size limit (and upload faster on mobile data).
+const MAX_SCAN_DIMENSION = 1600;
+
+const prepareImageForScan = (file: File): Promise<{ base64: string; mimeType: string }> =>
+  new Promise((resolve, reject) => {
+    // Fallback: send the original file unchanged (previous behaviour).
+    const readOriginal = () => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64 = typeof reader.result === 'string' ? reader.result.split(',')[1] : '';
+        if (base64) resolve({ base64, mimeType: file.type || 'image/jpeg' });
+        else reject(new Error('Could not read image file'));
+      };
+      reader.onerror = () => reject(reader.error ?? new Error('Could not read image file'));
+      reader.readAsDataURL(file);
+    };
+
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      try {
+        const w = img.naturalWidth, h = img.naturalHeight;
+        if (!w || !h) return readOriginal();
+        const scale = Math.min(1, MAX_SCAN_DIMENSION / Math.max(w, h));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(w * scale);
+        canvas.height = Math.round(h * scale);
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return readOriginal();
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const base64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+        if (base64) resolve({ base64, mimeType: 'image/jpeg' });
+        else readOriginal();
+      } catch {
+        readOriginal();
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      readOriginal();
+    };
+    img.src = url;
+  });
 
 // ... (interfaces remain the same)
 interface BloodPressureEntry {
@@ -612,32 +655,22 @@ const Dashboard: React.FC<DashboardProps> = ({ session, onPreviewLink, onPreview
     setIsAnalyzing(true);
     setAiError(null);
     try {
-      const imagePart = {
-        inlineData: { data: base64Image, mimeType: mimeType },
-      };
-      const textPart = {
-        text: "Analyze the image of a blood pressure monitor. Extract the systolic (SYS), diastolic (DIA), and pulse (PUL) values. Return the result as a JSON object with numeric keys: 'systolic', 'diastolic', and 'pulse'. If a value is not visible or cannot be determined, return null for that key."
-      };
+      // Use a fresh access token (getSession refreshes it if it has expired).
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData.session?.access_token ?? session.access_token;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: { parts: [imagePart, textPart] },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              systolic: { type: Type.NUMBER, description: "Systolic blood pressure value" },
-              diastolic: { type: Type.NUMBER, description: "Diastolic blood pressure value" },
-              pulse: { type: Type.NUMBER, description: "Pulse rate value" },
-            },
-            required: ["systolic", "diastolic", "pulse"],
-          },
+      const response = await fetch('/api/scan', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
         },
+        body: JSON.stringify({ image: base64Image, mimeType }),
       });
-
-      const jsonString = response.text.trim();
-      const data = JSON.parse(jsonString);
+      if (!response.ok) {
+        throw new Error(`Scan request failed with status ${response.status}`);
+      }
+      const data = await response.json();
 
       setFormData(prev => ({
         ...prev,
@@ -665,14 +698,12 @@ const Dashboard: React.FC<DashboardProps> = ({ session, onPreviewLink, onPreview
     const previewUrl = URL.createObjectURL(file);
     setImagePreview(previewUrl);
 
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const base64String = (reader.result as string).split(',')[1];
-      if (base64String) {
-        analyzeImageWithGemini(base64String, file.type);
-      }
-    };
-    reader.readAsDataURL(file);
+    prepareImageForScan(file)
+      .then(({ base64, mimeType }) => analyzeImageWithGemini(base64, mimeType))
+      .catch((error) => {
+        console.error("Error preparing image for scan:", error);
+        setAiError(t('modal.aiError'));
+      });
     e.target.value = '';
   };
 
